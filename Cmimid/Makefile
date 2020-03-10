@@ -51,13 +51,18 @@ build/%.d: examples/%.c src/instrument.py | build
 build/%.input: examples/%.input
 	cat $< > $@
 
-build/%.json.done: build/%.x
+build/%.inputs.done: examples/%.grammar
+	mkdir -p build/$*
+	#for i in examples/$*.input.*; do echo $$i; cp $$i build/; done
+	$(PYTHON) src/generateinputs.py examples/$*.grammar $* ./build/$*.out ./build/ 100
+	touch $@
+
+build/%.json.done: build/%.x build/%.inputs.done
 	mkdir -p $(pfuzzer)/build/
 	rm -rf $(pfuzzer)/build/*
 	cp examples/*.h build
 	cp -r build/* $(pfuzzer)/build
-	mkdir -p build/$*
-	for i in examples/$*.input.*; \
+	for i in build/$*.input.*; \
 	do\
 	  echo $$i; \
 	  cp $$i $(pfuzzer)/build/$*.input; \
@@ -80,26 +85,55 @@ build/%.events: build/%.json.done
 	mv $@_ $@
 
 
-build/%.grammar: build/%.events
-	$(PYTHON) ./src/treeminer.py $< > build/t1.json
-	$(PYTHON) ./src/generalizemethod.py build/t1.json > build/t2.json
-	$(PYTHON) ./src/generalizeloop.py build/t2.json > build/t3.json
-	$(PYTHON) ./src/grammar-miner.py build/t3.json
-	cp build/g.json $@
+build/%.tree: build/%.events
+	$(PYTHON) ./src/treeminer.py $< > build/$*-trees.json
+	$(PYTHON) ./src/generalizemethod.py build/$*-trees.json > build/$*-method_trees.json
+	$(PYTHON) ./src/generalizeloop.py build/$*-method_trees.json > build/$*-loop_trees.json
+	cp build/$*-loop_trees.json $@
 
+build/%.mgrammar: build/%.tree
+	$(PYTHON) ./src/grammar-miner.py build/$*.tree > build/$*-mined_g.json
+	$(PYTHON) ./src/generalizetokens.py build/$*-mined_g.json > build/$*-general_tokens.json
+	#$(PYTHON) ./src/generalizetokensize.py build/$*-general_tokens.json > build/$*-general_tokensize.json
+	cp build/$*-general_tokens.json $@
+
+build/%.grammar: build/%.mgrammar
+	$(PYTHON) ./src/grammar-compact.py build/$*.mgrammar > build/$*-compact.json
+	cp build/$*-compact.json $@
+
+
+build/%.pgrammar: build/%.grammar
+	$(PYTHON) ./src/parsinggrammar.py build/$*.grammar > build/$*-parsing.json
+	cp build/$*-parsing.json $@
+
+UNBUF=script -q -e -c
+PARSECOUNT=1000
+build/%.precision: build/%.pgrammar
+	$(UNBUF) "$(PYTHON) src/check_precision.py examples/$*.grammar build/$*.pgrammar ./build/$*.x ./build/$* $(PARSECOUNT) $*" /dev/null | tee $@.log
+	mv build/$*/$*.precision_ $@
+
+build/%.showtree: build/%.tree
+	$(PYTHON) ./src/ftree.py build/$*.tree | less -r
+
+build/%.showg: build/%.grammar
+	cat build/$*.grammar | jq . -C | less -r
 
 view:
 	CFLAGS=$(CFLAGS) ${PYTHON} ./bin/pyclasvi.py -l $(LIBCLANG_PATH)
 
 clean:
+	rm -rf build/*.json build/*.grammar
+
+clobber:
 	rm -rf build/*
 	cd $(pfuzzer) && $(MAKE) clean
+
 
 dump:
 	clang -Xclang -ast-dump -fsyntax-only $(src) -I examples
 
+FUZZCOUNT=1000
 build/%.fuzz: build/%.grammar build/%.out
-	$(PYTHON) ./src/fuzz.py $^
+	$(PYTHON) ./src/fuzz.py  $^ $(FUZZCOUNT)
+	mv build/$*.out.fuzz $@
 
-build/%.tree: build/%.grammar
-	$(PYTHON) ./src/ftree.py build/t1.json $(trees)

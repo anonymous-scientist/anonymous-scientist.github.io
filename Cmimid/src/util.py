@@ -1,9 +1,12 @@
 import urllib.parse
 import copy
+import os
 import random
 import json
 import subprocess
-from fuzzingbook.GrammarFuzzer import tree_to_string
+import grammartools as G
+#from fuzzingbook.GrammarFuzzer import tree_to_string
+import hashlib
 PARSE_SUCCEEDED = 10
 MAX_SAMPLES = 100
 MAX_PROC_SAMPLES = 100
@@ -11,8 +14,12 @@ MAX_PROC_SAMPLES = 100
 Epsilon = '-'
 NoEpsilon = '='
 
-def tree_to_str(tree):
-    return tree_to_string(tree)
+def hashit(s, n=3):
+    return hashlib.md5(s.encode()).hexdigest()[0:n]
+
+def tree_to_str_r(tree):
+    assert False
+    #return tree_to_string(tree)
 
 class O:
     def __init__(self, **keys): self.__dict__.update(keys)
@@ -22,26 +29,79 @@ def init_log(prefix, var, module):
     with open('%s.log' % module, 'a+') as f:
         print(prefix, ':==============',var, file=f)
 
-def do(command, env=None, shell=False, log=False, **args):
-    result = subprocess.Popen(command,
-        stdout = subprocess.PIPE,
-        stderr = subprocess.STDOUT,
-    )
-    stdout, stderr = result.communicate(timeout=PARSE_SUCCEEDED)
+def do(command, env=None, shell=False, log=False, inputv=None, timeout=PARSE_SUCCEEDED, **args):
+    result = None
+    if inputv:
+        result = subprocess.Popen(command,
+            stdin = subprocess.PIPE,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            shell = shell,
+            env=dict(os.environ, **({} if env is None else env))
+        )
+        result.stdin.write(inputv)
+        stdout, stderr = result.communicate(timeout=timeout)
+    else:
+        result = subprocess.Popen(command,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            shell = shell,
+            env=dict(os.environ, **({} if env is None else env))
+        )
+        stdout, stderr = result.communicate(timeout=timeout)
     if log:
         with open('build/do.log', 'a+') as f:
-            print(json.dumps({'cmd':command, 'env':env, 'exitcode':result.returncode}), env, file=f)
+            print(json.dumps({'cmd':command, 'env':env, 'exitcode':result.returncode}), env, flush=True, file=f)
+    if stdout is None: stdout = b''
+    if stderr is None: stderr = b''
+    result.kill()
     return O(returncode=result.returncode, stdout=stdout, stderr=stderr)
 
-#def do(command, env=None, shell=False, log=False, **args):
-#    result = run(command, universal_newlines=True, shell=shell,
-#                  env=dict(os.environ, **({} if env is None else env)),**args)
-#    return result
+def tree_to_str(tree):
+    expanded = []
+    to_expand = [tree]
+    while to_expand:
+        (key, children, *rest), *to_expand = to_expand
+        if G.is_nt(key):
+            #assert children # not necessary
+            to_expand = children + to_expand
+        else:
+            assert not children
+            expanded.append(key)
+    return ''.join(expanded)
+
+def tree_to_pstr(tree, op_='', _cl=''):
+    expanded = []
+    to_expand = [tree]
+    while to_expand:
+        (key, children), *to_expand = to_expand
+        if G.is_nt(key):
+            expanded.append(op_)
+            to_expand = children + [(_cl, [])] + to_expand
+        else:
+            assert not children
+            expanded.append(key)
+    return ''.join(expanded)
+
+def tree_to_pstr_r(tree, op_='', _cl=''):
+    symbol, children, *_ = tree
+    if children:
+        return "%s%s%s" % (op_, ''.join(tree_to_pstr_r(c, op_, _cl) for c in children), _cl)
+    else:
+        # TODO: assert symbol is terminal
+        # TODO: check if we need to parenthesize this too. We probably
+        # need this if the terminal symbols are more than one char wide.
+        #return "%s%s" % (op_, _cl)
+        return "%s%s%s" % (op_, symbol, _cl)
+
 EXEC_MAP = {}
 
-def check(o, e, s, module, sa1, sa2):
+def check_lowcost(o, x, e, ut, module, sa1, sa2):
+    s = tree_to_str(ut)
     if s in EXEC_MAP: return EXEC_MAP[s]
-    result = do([module, s])
+    tn = "%s_test.csv" % module
+    with open(tn, 'w+') as f: print(s, file=f, end='')
+    result = do([module, tn])
     with open('%s.log' % module, 'a+') as f:
         print('------------------', file=f)
         print('original:', repr(o), file=f)
@@ -55,6 +115,51 @@ def check(o, e, s, module, sa1, sa2):
     v = (result.returncode == 0)
     EXEC_MAP[s] = v
     return v
+
+def check_accurate(o, x, e, ut, module, sa1, sa2):
+    assert module.endswith('.x')
+    module = module[0:-2] + '.c'
+    s = tree_to_str(ut)
+    if s in EXEC_MAP: return EXEC_MAP[s]
+    updated_ps = tree_to_pstr(ut, op_='{', _cl='}')
+    tn = "%s_test.csv" % module
+    with open(tn, 'w+') as f: print(s, file=f, end='')
+
+    trace_out = do(["./bin/parsed_out.sh",tn, module] ).stdout.decode('UTF-8', 'ignore')
+    val = None
+    v = False
+    parsed_ps = None
+    try:
+        parsed_ps = trace_out.strip()
+        v = (parsed_ps == updated_ps)
+    except:
+        parsed_ps = 'ERROR'
+        v = False
+
+    with open('%s.log' % module, 'a+') as f:
+        print('------------------', file=f)
+        print(' '.join(["python", "build/%s" % module, s]), file=f)
+        print('Checking:',e, file=f)
+        print('original:', repr(o), file=f)
+        print('tmpl:', repr(x), file=f)
+        print('updated:', repr(s), file=f)
+        print('XXXX:', repr(sa1), file=f)
+        print('REPL:', repr(sa2), file=f)
+        print('ops:', repr(updated_ps), file=f)
+        print('pps:', repr(parsed_ps), file=f)
+        print(":=", v, file=f)
+    #     print(' '.join([module, repr(s)]), file=f)
+    #     print("\n", file=f)
+    # v = (result.returncode == 0)
+    EXEC_MAP[s] = v
+    return v
+
+ACCURATE_BUT_COSTLY = False
+
+if ACCURATE_BUT_COSTLY:
+    check = check_accurate
+else:
+    check = check_lowcost
 
 def to_modifiable(derivation_tree):
     node, children, *rest = derivation_tree
@@ -86,7 +191,8 @@ def replace_nodes(a2, a1):
     tmpl_name = '___cmimid___'
     old_name = node2[0]
     node2[0] = tmpl_name
-    t2_new = copy.deepcopy(t2)
+    v = json.dumps(t2)
+    t2_new = json.loads(v)
     node2[0] = old_name
 
     # now find the reference to tmpl_name in t2_new
@@ -96,7 +202,7 @@ def replace_nodes(a2, a1):
         node2.append(n)
     str2_new = tree_to_str(t2_new)
     assert str2_old != str2_new
-    return str2_new
+    return t2_new
 
 def is_compatible(a1, a2, module):
     t1 = is_a_replaceable_with_b(a1, a2, module)
@@ -108,9 +214,13 @@ def is_a_replaceable_with_b(a1, a2, module):
     n1, f1, t1 = a1
     n2, f2, t2 = a2
     if tree_to_str(n1) == tree_to_str(n2): return True
-    my_string = replace_nodes(a1, a2)
+    t_x = replace_nodes(a1, (('XXXX', []), None, a2))
+    x = tree_to_str(t_x)
+    updated_tree = replace_nodes(a1, a2)
+    updated_string = tree_to_str(updated_tree)
     o = tree_to_str(t1)
-    return check(o, n1[0], my_string, module, tree_to_str(a1[0]), tree_to_str(a2[0]))
+    v = check(o, x, n1[0], updated_tree, module, tree_to_str(a1[0]), tree_to_str(a2[0]))
+    return v
 
 def is_node_method(node):
     node_name = node[0]

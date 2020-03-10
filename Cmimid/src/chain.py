@@ -1,20 +1,22 @@
 import string
+import json
 import enum
 import sys
+import os.path
 
 import config
 import chainutils
 
 import random
 random.seed(config.RandomSeed)
+import numpy as np
+np.random.seed(config.RandomSeed)
+
 
 import pudb
 brk = pudb.set_trace
 
 COMPARE_OPERATORS = {'==': lambda x, y: x == y}
-
-def log(var, i=1):
-    if config.Debug >= i: print(repr(var), file=sys.stderr, flush=True)
 
 class EState(enum.Enum):
     Trim = enum.auto()
@@ -22,26 +24,23 @@ class EState(enum.Enum):
     Unknown = enum.auto()
 
 class Prefix:
-    def __init__(self, myarg):
-        self.my_arg = myarg
+    def __init__(self):
+        pass
 
     def __repr__(self):
         return repr(self.my_arg)
 
-    def solve(self, my_traces, seen):
+    def solve(self, prefix, my_traces, seen):
         raise NotImplemnted
 
-    def create_prefix(self, myarg):
+    def continue_valid(self, prefix):
         raise NotImplemnted
-
-    def continue_valid(self):
-        return []
 
 class Search(Prefix):
 
-    def continue_valid(self):
+    def continue_valid(self, prefix):
         if  random.uniform(0,1) > config.Return_Probability:
-            return [self.create_prefix(self.my_arg + random.choice(config.All_Characters))]
+            return [prefix + random.choice(config.All_Characters)]
         return []
 
     def parsing_state(self, h, limit_len):
@@ -62,8 +61,6 @@ class Search(Prefix):
         return [i[end] for i in similar]
 
 class DeepSearch(Search):
-
-    def create_prefix(self, myarg): return DeepSearch(myarg)
 
     def extract_solutions(self, elt, lst_solutions, flip=False):
         original = elt.op_B
@@ -117,8 +114,7 @@ class DeepSearch(Search):
                 solutions.append(lst)
         return solutions
 
-    def solve(self, traces, seen):
-        arg_prefix = self.my_arg
+    def solve(self, arg_prefix, traces, seen):
         # we are assuming a character by character comparison.
         # so get the comparison with the last element.
         while traces:
@@ -127,6 +123,7 @@ class DeepSearch(Search):
             k = self.parsing_state(h, limit_len=len(arg_prefix))
             new_prefix = arg_prefix[:end]
             fixes = self.get_previous_fixes(end, arg_prefix, seen)
+            kind = None
 
             if k == EState.Trim:
                 # A character comparison of the *last* char.
@@ -139,37 +136,43 @@ class DeepSearch(Search):
                 corr = self.get_corrections(cmp_stack, lambda i: i not in fixes)
                 if not corr: raise Exception('Exhausted attempts: %s' % fixes)
                 chars = sorted(set(sum(corr, [])))
+                kind = EState.Trim
 
             elif k == EState.Append:
                 assert new_prefix == arg_prefix
                 chars = config.All_Characters
+                kind = EState.Append
             else:
                 assert k == EState.Unknown
                 # Unknown what exactly happened. Strip the last and try again
                 traces = ltrace
                 continue
 
-            return [self.create_prefix("%s%s" % (new_prefix, new_char))
-                    for new_char in chars]
+            return kind, ["%s%s" % (new_prefix, new_char) for new_char in chars]
 
         return []
 
 class Chain:
 
-    def __init__(self, executable):
+    def __init__(self, executable, learner):
+        self.learner = learner
+        self.executable = executable
+        self.reset()
+        self.solver = DeepSearch()
+        if not os.path.exists('./build/metadata'):
+            chainutils.compile_src(self.executable)
+
+    def reset(self):
         self._my_arg = None
         self.seen = set()
-        self.executable = executable
-
-    def add_sys_arg(self, v):
-        self._my_arg = v
-
-    def sys_arg(self):
-        return self._my_arg
+        self.starting_fn = '<start>'
+        self.last_fn = self.starting_fn
+        self.traces = []
+        return self.last_fn
 
     def prune(self, solutions):
         # never retry an argument.
-        return [s for s in solutions if s.my_arg not in self.seen]
+        return [s for s in solutions if s not in self.seen]
 
     def choose(self, solutions):
         return [random.choice(self.prune(solutions))]
@@ -180,41 +183,241 @@ class Chain:
     def execute(self, my_input):
         return chainutils.execute(self.executable, my_input)
 
-    def gen_links(self):
-        # replace interesting things
-        arg = config.MyPrefix if config.MyPrefix else random.choice(config.All_Characters)
-        solution_stack = [DeepSearch(arg)]
 
-        chainutils.compile_src(self.executable)
-        for _ in range(config.MaxIter):
-            my_prefix, *solution_stack = solution_stack
-            self.current_prefix = my_prefix
-            self.add_sys_arg(my_prefix.my_arg)
+    def evaluate(self, arg):
+        self.current_prefix = arg
 
-            try:
-                log(">> %s" % self.sys_arg(), 1)
-                v = self.execute(self.sys_arg())
-                solution_stack = my_prefix.continue_valid()
-                if not solution_stack:
-                    return (self.sys_arg(), v)
-            except Exception as e:
-                self.seen.add(self.current_prefix.my_arg)
-                self.traces = self.get_comparisons()
+        print(">", repr(self.current_prefix), "(%s: %d %s %d)" % (
+            self.learner.cur_state,
+            self.learner.env.last_stack_len,
+            self.learner.env.e, self.learner.env.i), end="\r")
+        done, v = self.execute(self.current_prefix)
+        if done:
+            print(">",repr(self.current_prefix))
+            return None, [self.starting_fn], self.starting_fn, True, []
 
-                self.current_prefix = DeepSearch(self.current_prefix.my_arg)
+        self.seen.add(self.current_prefix)
+        self.traces = self.get_comparisons()
+        sol_kind, new_solutions = self.solver.solve(self.current_prefix, list(reversed(self.traces)), self.seen)
+        # new_state is the function seen in last comparison
 
-                new_solutions = self.current_prefix.solve(list(reversed(self.traces)), self.seen)
-                solution_stack = self.choose(new_solutions)
+        close_idx = len(self.current_prefix)
+        true_trace = [i for i in self.traces if i.x < close_idx]
+        if not true_trace:
+            brk()
+        state = "%s@%d" %(true_trace[-1].stack[-1],true_trace[-1].id)
+        #state = true_trace[-1].stack[-1]
+        return sol_kind, true_trace[-1].stack, state, False, self.prune(new_solutions)
 
-                if not solution_stack:
-                    # remove one character and try again.
-                    new_arg = self.sys_arg()[:-1]
-                    if not new_arg:
-                        raise Exception('DFS: No suitable continuation found')
-                    solution_stack = [self.current_prefix.create_prefix(new_arg)]
+class Env:
+    def __init__(self, chain):
+        self.chain = chain
+        self.prefix = ''
+        self.kind = EState.Append
+        self.solutions = []
+        self.last_stack_len = 0
+        self.e = '_'
+        self.i = 0
+
+        # TODO: how to deal with blacklist
+        # We need to create a different Q table with only blacklisted and associated characters which
+        # together is considered a state.
+        # We will use this table if we detect that a blacklisted state is entered, and update the table
+        # with the reward.
+        # If necessary, we can trim our prefix one extra character to make sure that the blacklist table
+        # gets the opportunity to predict the next char.
+
+        # REQUIRED: The basic blocks per method so that we can produce a Q table with methodname + blockid
+        # as the state. Note that in a pinch, Cmimid instrumentation can provide a more coarse grained
+        # identifier (not as fine as the basic block but not as coarse as the function name alone)
+        self.blacklist = set()
+
+    def reset(self):
+        self.prefix = ''
+        self.kind = EState.Append
+        self.solutions = []
+        self.last_stack_len = 0
+        return self.chain.reset()
+
+    def step(self, action, cur_state):
+        if self.kind == EState.Append:
+            self.prefix = self.prefix + action
+        else:
+            self.prefix = self.prefix[0:-1] + action
+        kind, stack, state, done, solutions = self.chain.evaluate(self.prefix)
+        self.solutions = solutions
+        # what should the next state be?
+        # if solutions given is prefix + ... then we have an append
+        if done:
+            self.last_stack_len = len(stack)
+            return stack, stack[-1], 100, True
+        else:
+            self.kind = kind
+            reward = -1
+            if kind == EState.Trim:
+                next_state = cur_state
+                reward = -10 # * len(stack)
+            elif kind == EState.Append:
+                next_state = state #stack[-1]
+                if len(stack)  == self.last_stack_len:
+                    if next_state == cur_state:
+                        reward = -10
+                    else:
+                        reward = -10
+                elif len(stack) < self.last_stack_len:
+                    reward = 10
+                else:
+                    reward = -10
+            else:
+                assert False
+            self.last_stack_len = len(stack)
+
+            #if next_state != self.chain.starting_fn:
+            #    if kind == EState.Append and next_state not in stack:
+            #        brk()
+
+            return stack, next_state, reward, False
+
+
+class Learner: pass
+class QLearner(Learner):
+    def __init__(self, program, qarr=None):
+        self.program = program
+        self.actions = config.All_Characters
+        starting_state = '<start>'
+        self.cur_state = starting_state
+        self.env = Env(Chain(program, self))
+        self.states = [starting_state] + chainutils.get_functions()
+        #self.action_reward = {}
+        self.action_chars = {}
+
+        self.alpha = 0.5 # learning rate
+        self.gamma = 0.90 # discount factor -- 0.8 - 0.99
+        self.epsilon_init = 1.0 # explore/exploit factor
+        self.epsilon = self.epsilon_init
+        self.epsilon_min = 0.001
+        self.epsilon_decay = 0.999
+        self.qarrf = 'Q.json'
+        if os.path.exists(self.qarrf):
+            with open(self.qarrf) as f:
+                self.Q = json.load(fp=f)
+        else:
+            self.Q = {'_': {a:0 for a in self.actions}}
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = (100.0 - len(self.env.prefix))/100.0
+        else:
+            self.epsilon = self.epsilon_min
+        #    self.epsilon *= self.epsilon_decay
+
+
+    def sidx(self, state):
+        return next(i for i,a in enumerate(self.states) if a == state)
+
+    def aidx(self, action):
+        return next(i for i,a in enumerate(self.actions) if a == action)
+
+    def update_Q(self, state, action, new_state, reward):
+        if state not in self.Q: self.Q[state] = dict(self.Q['_'])
+        if new_state not in self.Q: self.Q[new_state] = dict(self.Q['_'])
+
+        self.Q[state][action] = ((1 - self.alpha) * self.Q[state][action]) + \
+                self.alpha * (reward + self.gamma * max(self.Q[new_state].values()))
+        return True
+
+    def randargmax(self, hm, actions):
+        items = [(k,v) for k,v in hm.items() if k in actions]
+        max_val = max([v for k,v in items])
+        return random.choice([k for k,v in items if v == max_val])
+
+    def printS_(self, s, f):
+        print(s, file=f)
+        for a in self.actions:
+            print("%s:%0.4f" % (repr(a)[1:-1], self.Q[s][a]), end=',', file=f)
+        print('',file=f)
+
+    def printS(self, s=None):
+        if s is None:
+            s = self.cur_state
+        with open('Qs.debug', 'w+') as f:
+            self.printS_(s, f)
+
+    def printQ(self):
+        with open('Q.debug', 'w+') as f:
+            for s in self.states: self.printS_(s, f)
+
+    def next_action(self):
+        if not self.env.solutions:
+            self.env.e = 'r'
+            return random.choice(config.All_Characters)
+        chars = [c[-1] for c in self.env.solutions] if self.env.solutions else config.All_Characters
+        if self.cur_state in self.env.blacklist:
+            self.env.e = 'B(....)'
+            return random.choice(chars)
+        elif random.uniform(0,1) < self.epsilon:
+            self.env.e = 'R(%s)' % self.epsilon
+            return random.choice(chars)
+        else:
+            self.env.e = '^(%s)' % self.epsilon
+            maxval = max(self.Q[self.cur_state].values())
+            if maxval == 0:
+                self.env.e = '.(%s)' % self.epsilon
+            act = self.randargmax(self.Q[self.cur_state], chars)
+            return act
+
+    def learn(self, episodes):
+        # start over each time.
+        self.cur_state = self.env.reset()
+        done = False
+
+        for _ in range(episodes):
+            self.epsilon = self.epsilon_init
+            self.cur_state = self.env.reset()
+            for i in range(config.MaxIter):
+                self.env.i = i
+                chainutils.check_debug()
+                self.printS()
+                action = self.next_action()
+                last_stack, next_state, reward, done = self.env.step(action, self.cur_state)
+
+                # We can only trust appends
+                if self.env.kind == EState.Append:
+                    prefix_checked_chars = [i.op_B for i in self.env.chain.traces if i.stack == last_stack] # TODO; shold we filter close_char
+
+                    str_prefix = ''.join(prefix_checked_chars)
+                    key = next_state #self.cur_state
+                    if key not in self.action_chars:
+                        self.action_chars[key] = str_prefix
+
+                    old_prefix = self.action_chars[key]
+                    if key != self.env.chain.starting_fn:
+                        if len(str_prefix) > len(old_prefix):
+                            # we need a way to handle loops.
+                            if not set(old_prefix).issubset(set(str_prefix)):
+                                self.env.blacklist.add(key)
+                                #if not key in {'json_is_literal', 'has_char'}:
+                                #    brk()
+                                #    print()
+                            self.action_chars[key] = str_prefix
+                        else:
+                            if not set(str_prefix).issubset(set(old_prefix)):
+                                self.env.blacklist.add(key)
+                                #if not key in {'json_is_literal', 'has_char'}:
+                                #    brk()
+                                #    print()
+                    #print("> ", key, repr(self.action_chars[key]))
+
+                self.update_Q(self.cur_state, action, next_state, reward)
+                self.cur_state = next_state
+                if done:
+                    break
+                self.update_epsilon()
+            with open('Q.json', 'w+') as f:
+                json.dump(self.Q, fp=f)
 
 def main(program, *rest):
-    chain = Chain(program)
-    chain.gen_links()
+    learner = QLearner(program)
+    learner.learn(100)
 
 main(*sys.argv[1:])

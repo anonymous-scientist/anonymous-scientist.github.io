@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import sys
+import os
 import glob
 import json
 import pudb
@@ -188,9 +189,15 @@ def track_comparison(e, inputstring, gen_events):
     # 'operand': ['\n'],
     # 'id': 1, 'stack': ['_real_program_main']}
     indexes = [int(i) for i in e['index']]
+    #for i in indexes:
+    #    assert i < len(inputstring)
     for i in indexes:
         # we need only the accessed indexes
-        gen_events.append(('_', ('comparison', i, inputstring)))
+        # some of the access may go up to the last null byte
+        if i < len(inputstring):
+            gen_events.append(('_', ('comparison', i, inputstring)))
+        else:
+            assert i == len(inputstring)
 
 def show_nested(gen_events):
     indent = 0
@@ -289,16 +296,24 @@ def process_events(events, inputstring):
     assert not cmimid_stack
     return fire_events(gen_events, inputstring)
 
-event_dir = sys.argv[1]
-if event_dir.endswith('/'):
-    event_dir = event_dir[0:-1]
-returns = []
-for arg in glob.glob("%s/*.json" % event_dir):
-    ifile = arg.replace('.json', '')
-    with open(ifile) as f:
-        inputstr = f.read()
-    max_len = len(inputstr)
-    events = read_json(arg)
-    ret = process_events(events, inputstr)
-    returns.append(ret)
-print(json.dumps(returns))
+
+
+if __name__ == '__main__':
+    event_dir = sys.argv[1]
+    returns = []
+    lst = [event_dir]
+    if os.path.isdir(event_dir):
+        if event_dir.endswith('/'):
+            event_dir = event_dir[0:-1]
+        lst = glob.glob("%s/*.json" % event_dir)
+    for arg in lst:
+        ifile = arg.replace('.json', '')
+        with open(ifile, mode='r+b') as f:
+            inputstr = f.read().decode()
+        max_len = len(inputstr)
+        assert max_len == os.path.getsize(ifile)
+
+        events = read_json(arg)
+        ret = process_events(events, inputstr)
+        returns.append(ret)
+    print(json.dumps(returns))

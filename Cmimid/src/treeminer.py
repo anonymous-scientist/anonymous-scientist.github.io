@@ -4,7 +4,7 @@ import json
 import itertools as it
 
 from operator import itemgetter
-from fuzzingbook.GrammarFuzzer import tree_to_string
+import util
 
 def reconstruct_method_tree(method_map):
     first_id = None
@@ -32,9 +32,9 @@ def reconstruct_method_tree(method_map):
     return first_id, tree_map
 
 
-
+LAST_COMPARISON_HEURISTIC = True
 def last_comparisons(comparisons):
-    HEURISTIC = True
+    LAST_COMPARISON_HEURISTIC = True
     last_cmp_only = {}
     last_idx = {}
 
@@ -51,9 +51,10 @@ def last_comparisons(comparisons):
     # next, for each index, find the method that
     # accessed it last.
     for idx, char, mid in comparisons:
-        if HEURISTIC:
+        if LAST_COMPARISON_HEURISTIC:
             if idx in last_cmp_only:
-                if last_cmp_only[idx] > mid:
+                midC = last_cmp_only[idx]
+                if midC > mid:
                     # do not clobber children unless it was the last character
                     # for that child.
                     if last_idx[mid] > idx:
@@ -85,17 +86,19 @@ def indexes_to_children(indexes, my_str):
 
     return [to_node(n, my_str) for n in lst]
 
-def does_item_overlap(s, e, s_, e_):
+def does_item_overlap(r, r_):
+    (s, e), (s_, e_) = r, r_
     return (s_ >= s and s_ <= e) or (e_ >= s and e_ <= e) or (s_ <= s and e_ >= e)
 
-def is_second_item_included(s, e, s_, e_):
+def is_second_item_included(r, r_):
+    (s, e), (s_, e_) = r, r_
     return (s_ >= s and e_ <= e)
 
-def has_overlap(ranges, s_, e_):
-    return {(s, e) for (s, e) in ranges if does_item_overlap(s, e, s_, e_)}
+def has_overlap(ranges, r_):
+    return {r for r in ranges if does_item_overlap(r, r_)}
 
-def is_included(ranges, s_, e_):
-    return {(s, e) for (s, e) in ranges if is_second_item_included(s, e, s_, e_)}
+def is_included(ranges, r_):
+    return {r for r in ranges if is_second_item_included(r, r_)}
 
 def remove_overlap_from(original_node, orange):
     node, children, start, end = original_node
@@ -105,7 +108,7 @@ def remove_overlap_from(original_node, orange):
     start = -1
     end = -1
     for child in children:
-        if does_item_overlap(*child[2:4], *orange):
+        if does_item_overlap(child[2:4], orange):
             new_child = remove_overlap_from(child, orange)
             if new_child: # and new_child[1]:
                 if start == -1: start = new_child[2]
@@ -125,11 +128,12 @@ def no_overlap(arr):
     my_ranges = {}
     for a in arr:
         _, _, s, e = a
-        included = is_included(my_ranges, s, e)
+        r = (s, e)
+        included = is_included(my_ranges, r)
         if included:
             continue  # we will fill up the blanks later.
         else:
-            overlaps = has_overlap(my_ranges, s, e)
+            overlaps = has_overlap(my_ranges, r)
             if overlaps:
                 # unlike include which can happen only once in a set of
                 # non-overlapping ranges, overlaps can happen on multiple parts.
@@ -139,13 +143,13 @@ def no_overlap(arr):
                 # assert len(overlaps) == 1
                 #oitem = list(overlaps)[0]
                 for oitem in overlaps:
-                    v = remove_overlap_from(my_ranges[oitem], (s,e))
+                    v = remove_overlap_from(my_ranges[oitem], r)
                     del my_ranges[oitem]
                     if v:
                         my_ranges[v[2:4]] = v
-                    my_ranges[(s, e)] = a
+                    my_ranges[r] = a
             else:
-                my_ranges[(s, e)] = a
+                my_ranges[r] = a
     res = my_ranges.values()
     # assert no overlap, and order by starting index
     s = sorted(res, key=lambda x: x[2])
@@ -179,6 +183,22 @@ def to_tree(node, my_str):
     m = (method_name, my_children, start_idx, end_idx)
     return m
 
+def wrap_terminals(node):
+    # the idea is to wrap any children that are directly terminal nodes
+    # with a nonterminal with the name prefix.
+    method_name, my_children, start_idx, end_idx = node
+    mprefix, *rest = method_name[1:-1].split(':')
+    prefix = "%s_%s" % (mprefix, util.hashit("token" + ''.join(rest)))
+    my_c = []
+    for i,c in enumerate(my_children):
+       cmethod_name, cmy_children, cstart_idx, cend_idx = c
+       if (cmethod_name[0], cmethod_name[-1]) != ('<', '>'):
+           my_c.append(("<%s>" % (prefix + str(i)), [(cmethod_name, cmy_children, cstart_idx, cend_idx)], cstart_idx, cend_idx))
+       else:
+           my_c.append(wrap_terminals(c))
+    return (method_name, my_c, start_idx, end_idx)
+
+
 import os.path, copy, random
 random.seed(0)
 
@@ -195,15 +215,35 @@ def miner(call_traces):
 
         #print("INPUT:", my_str, file=sys.stderr)
         tree = to_tree(method_tree[first], my_str)
+        tree_ = wrap_terminals(tree)
         #print("RECONSTRUCTED INPUT:", tree_to_string(tree), file=sys.stderr)
-        my_tree = {'tree': tree, 'original': call_trace['original'], 'arg': call_trace['arg']}
-        assert tree_to_string(tree) == my_str
+        my_tree = {'tree': tree_, 'original': call_trace['original'], 'arg': call_trace['arg']}
+        assert util.tree_to_str(tree) == my_str
         my_trees.append(my_tree)
     return my_trees
 
+def tree_to_pstr(tree, op_='', _cl=''):
+    symbol, children, *_ = tree
+    if children:
+        return "%s%s%s" % (op_, ''.join(tree_to_pstr(c, op_, _cl) for c in children), _cl)
+    else:
+        # TODO: assert symbol is terminal
+        # TODO: check if we need to parenthesize this too. We probably
+        # need this if the terminal symbols are more than one char wide.
+        return "%s%s%s" % (op_, symbol, _cl)
+
+import os
 def main(tracefile):
     with open(tracefile) as f:
         my_trace = json.load(f)
     mined_trees = miner(my_trace)
-    json.dump(mined_trees, sys.stdout)
-main(sys.argv[1])
+    if os.environ.get('PARSE') is not None:
+        print(tree_to_pstr(mined_trees[0]['tree'], '{', '}'))
+    else:
+        for tree in mined_trees:
+            with open(tree['arg'] + '.tree', 'w+') as f:
+                print(json.dumps(tree, indent=4), file=f)
+        print(json.dumps(mined_trees, indent=4))
+
+if __name__ == '__main__':
+    main(sys.argv[1])

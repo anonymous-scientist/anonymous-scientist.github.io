@@ -1,18 +1,26 @@
 import subprocess
 import json
+import os
+import os.path
 import config
+import pudb
+brk = pudb.set_trace
 
 def compile_src(executable):
     with open('build/exec_file', 'w+') as f:
         print('''
-pfuzzer=../checksum-repair
+pfuzzer=../taints
 cp examples/*.h ./build
 cp -r build/* $pfuzzer/build
-{
-cd ../checksum-repair;
-./install/bin/trace-instr build/%s.c ./samples/excluded_functions 2>err >out
-}
-''' % executable, file=f)
+cp examples/%(program)s.c $pfuzzer/build
+(
+cd ../taints;
+./install/bin/trace-instr build/%(program)s.c ./samples/excluded_functions 2>err >out
+)
+# generate metadata
+echo | $pfuzzer/build/%(program)s.c.instrumented
+cp $pfuzzer/build/metadata build/
+''' % {'program':executable}, file=f)
     do(["bash", "./build/exec_file"], shell=False, input='')
 
 def strsearch(Y, x):
@@ -49,30 +57,35 @@ def do(command, env=None, shell=False, log=False,input=None, **args):
     stdout, stderr = result.communicate(timeout=config.TIMEOUT, input=input.encode('ascii'))
     return O(returncode=result.returncode, stdout=stdout, stderr=stderr)
 
+def check_debug():
+    if os.path.exists('/tmp/.debug'):
+        os.remove('/tmp/.debug')
+        brk()
+
 def execute(executable, my_input):
-    # first write the input in checksum-repair build
-    with open('../checksum-repair/build/%s.input' % executable, 'w+') as f:
+    # first write the input in taints build
+    with open('../taints/build/%s.input' % executable, 'w+') as f:
         print(my_input, end='', file=f)
     with open('build/exec_file', 'w+') as f:
         print('''
-exec ../checksum-repair/build/%(program)s.c.uninstrumented < ../checksum-repair/build/%(program)s.input
+exec ../taints/build/%(program)s.c.uninstrumented < ../taints/build/%(program)s.input
 ''' % {'program':executable}, file=f)
     result1 = do(["bash", "./build/exec_file"], shell=False, input=my_input)
     if result1.returncode == 0:
-        return result1
+        return (True, result1)
 
     # try to identify if we have an EOF
     with open('build/exec_file', 'w+') as f:
         print('''
-../checksum-repair/build/%(program)s.c.instrumented < ../checksum-repair/build/%(program)s.input
+../taints/build/%(program)s.c.instrumented < ../taints/build/%(program)s.input
 gzip -c output > build/output.gz
-exec ../checksum-repair/install/bin/trace-taint -me build/metadata -po build/pygmalion.json -t build/output.gz
+exec ../taints/install/bin/trace-taint -me build/metadata -po build/pygmalion.json -t build/output.gz
 ''' % {'program':executable}, file=f)
 
-    with open('../checksum-repair/build/%s.input' % executable, 'w+') as f:
+    with open('../taints/build/%s.input' % executable, 'w+') as f:
         print(my_input + config.eof_char, end='', file=f)
     result2 = do(["bash", "./build/exec_file"], shell=False, input=my_input)
-    raise Exception(result2)
+    return (False, result2)
 
 
 def get_comparisons():
@@ -89,10 +102,15 @@ def get_comparisons():
             if line['operator'] == 'switch':
                 assert len(line['index']) == 1
                 for k in line['operand']:
-                    input_comparisons.append(O(**{'x': line['index'][0], 'op': '==', 'op_B': k, 'op_A': line['value']}))
+                    input_comparisons.append(O(**{
+                        'x': line['index'][0], 'op': '==', 'op_B': k, 'op_A': line['value'], 'stack': line['stack'], 'id': line['id']
+                        }))
             elif line['operator'] == '==':
                 assert len(line['index']) == 1
-                input_comparisons.append(O(**{'x': line['index'][0], 'op': line['operator'], 'op_B':line['operand'][0], 'op_A': line['value']}))
+                input_comparisons.append(
+                        O(**{
+                            'x': line['index'][0], 'op': line['operator'], 'op_B':line['operand'][0], 'op_A': line['value'], 'stack': line['stack'], 'id': line['id']
+                                }))
             elif line['operator'] == 'conversion':
                 continue
             elif line['operator'] == 'strcmp':
@@ -110,7 +128,9 @@ def get_comparisons():
                     op_B = Bchars[i]
                     if i >= len(line['value']): break
                     op_A = Achars[i]
-                    input_comparisons.append(O(**{'x': k, 'op': '==', 'op_B': op_B, 'op_A': op_A}))
+                    input_comparisons.append(O(**{
+                        'x': k, 'op': '==', 'op_B': op_B, 'op_A': op_A, 'stack': line['stack'], 'id': line['id']
+                        }))
                     if op_A != op_B: break
 
             elif line['operator'] == 'strsearch':
@@ -125,7 +145,9 @@ def get_comparisons():
                     op_A, op_B = y, x
                     k = idxs[i_j]
                     #assert chain.sys_arg()[k] + config.eof_char == op_A
-                    input_comparisons.append(O(**{'x': k, 'op': '==', 'op_B': op_B, 'op_A': op_A}))
+                    input_comparisons.append(O(**{
+                        'x': k, 'op': '==', 'op_B': op_B, 'op_A': op_A, 'stack': line['stack'], 'id': line['id']
+                        }))
 
             else:
                 assert False
@@ -134,4 +156,15 @@ def get_comparisons():
     #        continue
     #    assert chain.sys_arg()[i.x] == i.op_A
     return input_comparisons
+
+
+def get_functions():
+    functions = []
+    with open('build/metadata') as f:
+        lines = f.readlines()
+    for sline in lines:
+        line = json.loads(sline)
+        if not 'f' in line: continue
+        functions.append(line['f'])
+    return functions
 
